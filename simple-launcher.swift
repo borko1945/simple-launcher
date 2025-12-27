@@ -135,17 +135,28 @@ final class LauncherWindow: NSWindow {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: LauncherWindow!
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
-        window = LauncherWindow(contentRect: NSRect(origin: .zero, size: Config.windowSize),
-                                styleMask: [.borderless, .fullSizeContentView],
-                                backing: .buffered, defer: false)
-        window.center(); window.isOpaque = false; window.backgroundColor = .clear
-        window.delegate = self; window.level = .floating; window.isMovableByWindowBackground = true
-        window.contentView = NSHostingView(rootView: ContentView())
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
+func applicationDidFinishLaunching(_ notification: Notification) {
+    NSApp.setActivationPolicy(.regular)
+    
+    // 1. Added .resizable to the styleMask
+    window = LauncherWindow(contentRect: NSRect(origin: .zero, size: Config.windowSize),
+                            styleMask: [.borderless, .fullSizeContentView, .resizable],
+                            backing: .buffered, defer: false)
+    
+    window.center()
+    window.isOpaque = false
+    window.backgroundColor = .clear
+    window.delegate = self
+    window.level = .floating
+    window.isMovableByWindowBackground = true
+    
+    // 2. This line handles saving and restoring the size/position automatically
+    window.setFrameAutosaveName("LauncherMainWindow")
+    
+    window.contentView = NSHostingView(rootView: ContentView())
+    window.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+}
     func windowDidResignKey(_ notification: Notification) { NSApp.terminate(nil) }
 }
 
