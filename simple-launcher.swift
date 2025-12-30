@@ -2,20 +2,39 @@ import SwiftUI
 import AppKit
 
 // MARK: - Models & Logic
-struct AppModel: Identifiable {
-    let id = UUID()
+struct AppModel: Identifiable, Codable {
+    let id: UUID
     let name: String
-    let url: URL
-    let icon: NSImage
+    let urlPath: String
     let lastLaunched: Double
+    
+    var url: URL { URL(fileURLWithPath: urlPath) }
+    
+    // Icons are NOT cached - always load fresh (fast operation)
+    var icon: NSImage {
+        let icon = NSWorkspace.shared.icon(forFile: urlPath)
+        icon.size = NSSize(width: 512, height: 512)
+        return icon
+    }
+    
+    init(id: UUID = UUID(), name: String, url: URL, lastLaunched: Double) {
+        self.id = id
+        self.name = name
+        self.urlPath = url.path
+        self.lastLaunched = lastLaunched
+    }
 }
 
 class LauncherViewModel: ObservableObject {
     @Published var apps: [AppModel] = []
     @Published var searchText = ""
+    @Published var isLoading = false
+    
     private let historyKey = "launcher.history"
+    private let cacheKey = "launcher.appCache"
     
     init() {
+        loadFromCache()
         load()
     }
     
@@ -23,13 +42,21 @@ class LauncherViewModel: ObservableObject {
         searchText.isEmpty ? apps : apps.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
     
+    func loadFromCache() {
+        if let data = UserDefaults.standard.data(forKey: cacheKey),
+           let cached = try? JSONDecoder().decode([AppModel].self, from: data) {
+            self.apps = cached
+        }
+    }
+    
     func load() {
+        isLoading = true
+        
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let self = self else { return }
             
             let history = UserDefaults.standard.dictionary(forKey: self.historyKey) as? [String: Double] ?? [:]
             
-            // Expanded search paths to find more system apps
             let paths = [
                 "/Applications",
                 "/System/Applications",
@@ -42,7 +69,7 @@ class LauncherViewModel: ObservableObject {
             var foundApps: [AppModel] = []
             var seenPaths = Set<String>()
             
-            // 1. Scan directories for .app bundles
+            // Scan directories
             for path in paths {
                 let url = URL(fileURLWithPath: path)
                 guard let contents = try? FileManager.default.contentsOfDirectory(
@@ -51,21 +78,18 @@ class LauncherViewModel: ObservableObject {
                     options: .skipsHiddenFiles
                 ) else { continue }
                 
-                for itemURL in contents {
+                for itemURL in contents where itemURL.pathExtension == "app" {
                     let itemPath = itemURL.path
                     guard !seenPaths.contains(itemPath) else { continue }
                     seenPaths.insert(itemPath)
                     
-                    // Check if it's an app bundle
-                    if itemURL.pathExtension == "app" {
-                        if let app = self.createAppModel(from: itemURL, history: history) {
-                            foundApps.append(app)
-                        }
+                    if let app = self.createAppModel(from: itemURL, history: history) {
+                        foundApps.append(app)
                     }
                 }
             }
             
-            // 2. Get URLs of all registered applications
+            // Query Launch Services for additional apps
             if let appURLs = LSCopyApplicationURLsForURL(
                 URL(fileURLWithPath: "/Applications") as CFURL,
                 .all
@@ -87,13 +111,23 @@ class LauncherViewModel: ObservableObject {
                 return $0.name.localizedStandardCompare($1.name) == .orderedAscending
             }
             
-            DispatchQueue.main.async { self.apps = sorted }
+            // Update UI and cache
+            DispatchQueue.main.async {
+                self.apps = sorted
+                self.isLoading = false
+                self.saveToCache(sorted)
+            }
+        }
+    }
+    
+    private func saveToCache(_ apps: [AppModel]) {
+        if let data = try? JSONEncoder().encode(apps) {
+            UserDefaults.standard.set(data, forKey: cacheKey)
         }
     }
     
     private func createAppModel(from url: URL, history: [String: Double]) -> AppModel? {
-        let icon = NSWorkspace.shared.icon(forFile: url.path)
-        icon.size = NSSize(width: 512, height: 512)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         
         // Try to get proper display name
         var displayName = url.deletingPathExtension().lastPathComponent
@@ -106,7 +140,6 @@ class LauncherViewModel: ObservableObject {
         return AppModel(
             name: displayName,
             url: url,
-            icon: icon,
             lastLaunched: history[url.path] ?? 0
         )
     }
@@ -130,20 +163,33 @@ struct ContentView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            // Search Bar
-            TextField("Search...", text: $vm.searchText)
-                .textFieldStyle(.plain)
-                .font(.largeTitle.weight(.light))
-                .focused($focus)
-                .padding(.horizontal, 24)
-                .padding(.top, 20)
-                .padding(.bottom, 10)
-                .onSubmit { 
-                    if !vm.filtered.isEmpty && selectedIndex < vm.filtered.count { 
-                        vm.launch(vm.filtered[selectedIndex]) 
+            // Search Bar with Refresh Button
+            HStack(spacing: 12) {
+                TextField("Search...", text: $vm.searchText)
+                    .textFieldStyle(.plain)
+                    .font(.largeTitle.weight(.light))
+                    .focused($focus)
+                    .onSubmit { 
+                        if !vm.filtered.isEmpty && selectedIndex < vm.filtered.count { 
+                            vm.launch(vm.filtered[selectedIndex]) 
+                        }
                     }
+                    .onExitCommand { NSApp.terminate(nil) }
+                
+                Button(action: { vm.load() }) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.title2)
+                        .foregroundColor(.primary.opacity(0.7))
+                        .rotationEffect(.degrees(vm.isLoading ? 360 : 0))
+                        .animation(vm.isLoading ? .linear(duration: 1).repeatForever(autoreverses: false) : .default, value: vm.isLoading)
                 }
-                .onExitCommand { NSApp.terminate(nil) }
+                .buttonStyle(.plain)
+                .disabled(vm.isLoading)
+                .help("Refresh app list")
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 20)
+            .padding(.bottom, 10)
             
             // App Grid
             ScrollView {
