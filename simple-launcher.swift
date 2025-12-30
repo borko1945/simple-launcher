@@ -16,7 +16,6 @@ class LauncherViewModel: ObservableObject {
     private let historyKey = "launcher.history"
     
     init() {
-        // Start loading immediately upon initialization
         load()
     }
     
@@ -25,48 +24,98 @@ class LauncherViewModel: ObservableObject {
     }
     
     func load() {
-        // Run heavy I/O (scanning & icon generation) on background thread
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let self = self else { return }
             
-            // Load History
             let history = UserDefaults.standard.dictionary(forKey: self.historyKey) as? [String: Double] ?? [:]
-            let paths = ["/Applications", "/System/Applications", NSHomeDirectory() + "/Applications"]
             
-            // Scan & Map
-            let found = paths.map { URL(fileURLWithPath: $0) }
-                .flatMap { (try? FileManager.default.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)) ?? [] }
-                .filter { $0.pathExtension == "app" }
-                .compactMap { url -> AppModel? in
-                    let icon = NSWorkspace.shared.icon(forFile: url.path)
-                    // Request high-res icon (512pt) so it scales down sharply on Retina displays
-                    icon.size = NSSize(width: 512, height: 512)
+            // Expanded search paths to find more system apps
+            let paths = [
+                "/Applications",
+                "/System/Applications",
+                "/System/Applications/Utilities",
+                "/System/Library/CoreServices",
+                "/System/Library/CoreServices/Applications",
+                NSHomeDirectory() + "/Applications"
+            ]
+            
+            var foundApps: [AppModel] = []
+            var seenPaths = Set<String>()
+            
+            // 1. Scan directories for .app bundles
+            for path in paths {
+                let url = URL(fileURLWithPath: path)
+                guard let contents = try? FileManager.default.contentsOfDirectory(
+                    at: url,
+                    includingPropertiesForKeys: nil,
+                    options: .skipsHiddenFiles
+                ) else { continue }
+                
+                for itemURL in contents {
+                    let itemPath = itemURL.path
+                    guard !seenPaths.contains(itemPath) else { continue }
+                    seenPaths.insert(itemPath)
                     
-                    return AppModel(
-                        name: url.deletingPathExtension().lastPathComponent,
-                        url: url,
-                        icon: icon,
-                        lastLaunched: history[url.path] ?? 0
-                    )
+                    // Check if it's an app bundle
+                    if itemURL.pathExtension == "app" {
+                        if let app = self.createAppModel(from: itemURL, history: history) {
+                            foundApps.append(app)
+                        }
+                    }
                 }
-                .sorted {
-                    // Sort by MRU (Most Recently Used), then Alphabetical
-                    if $0.lastLaunched != $1.lastLaunched { return $0.lastLaunched > $1.lastLaunched }
-                    return $0.name.localizedStandardCompare($1.name) == .orderedAscending
-                }
+            }
             
-            // Update UI on Main Thread
-            DispatchQueue.main.async { self.apps = found }
+            // 2. Get URLs of all registered applications
+            if let appURLs = LSCopyApplicationURLsForURL(
+                URL(fileURLWithPath: "/Applications") as CFURL,
+                .all
+            )?.takeRetainedValue() as? [URL] {
+                for url in appURLs {
+                    let path = url.path
+                    guard !seenPaths.contains(path) else { continue }
+                    seenPaths.insert(path)
+                    
+                    if let app = self.createAppModel(from: url, history: history) {
+                        foundApps.append(app)
+                    }
+                }
+            }
+            
+            // Sort by MRU, then alphabetically
+            let sorted = foundApps.sorted {
+                if $0.lastLaunched != $1.lastLaunched { return $0.lastLaunched > $1.lastLaunched }
+                return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            }
+            
+            DispatchQueue.main.async { self.apps = sorted }
         }
     }
     
+    private func createAppModel(from url: URL, history: [String: Double]) -> AppModel? {
+        let icon = NSWorkspace.shared.icon(forFile: url.path)
+        icon.size = NSSize(width: 512, height: 512)
+        
+        // Try to get proper display name
+        var displayName = url.deletingPathExtension().lastPathComponent
+        if let bundle = Bundle(url: url),
+           let name = bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? 
+                      bundle.object(forInfoDictionaryKey: "CFBundleName") as? String {
+            displayName = name
+        }
+        
+        return AppModel(
+            name: displayName,
+            url: url,
+            icon: icon,
+            lastLaunched: history[url.path] ?? 0
+        )
+    }
+    
     func launch(_ app: AppModel) {
-        // Update history
         var history = UserDefaults.standard.dictionary(forKey: historyKey) as? [String: Double] ?? [:]
         history[app.url.path] = Date().timeIntervalSince1970
         UserDefaults.standard.set(history, forKey: historyKey)
         
-        // Open App & Terminate Launcher
         NSWorkspace.shared.open(app.url)
         NSApp.terminate(nil)
     }
@@ -76,39 +125,43 @@ class LauncherViewModel: ObservableObject {
 struct ContentView: View {
     @StateObject var vm = LauncherViewModel()
     @FocusState var focus: Bool
+    @State private var selectedIndex: Int = 0
+    @State private var previousSearchText: String = ""
     
     var body: some View {
         VStack(spacing: 0) {
             // Search Bar
             TextField("Search...", text: $vm.searchText)
                 .textFieldStyle(.plain)
-                .font(.largeTitle.weight(.light)) // Large, distinct input font
+                .font(.largeTitle.weight(.light))
                 .focused($focus)
                 .padding(.horizontal, 24)
                 .padding(.top, 20)
                 .padding(.bottom, 10)
-                .onSubmit { if let first = vm.filtered.first { vm.launch(first) } }
-                .onExitCommand { NSApp.terminate(nil) } // ESC to quit
+                .onSubmit { 
+                    if !vm.filtered.isEmpty && selectedIndex < vm.filtered.count { 
+                        vm.launch(vm.filtered[selectedIndex]) 
+                    }
+                }
+                .onExitCommand { NSApp.terminate(nil) }
             
             // App Grid
             ScrollView {
-                // Layout: Ultra-tight grid (spacing: 3)
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 110), spacing: 3)], spacing: 3) {
-                    ForEach(vm.filtered) { app in
+                    ForEach(Array(vm.filtered.enumerated()), id: \.element.id) { index, app in
                         Button(action: { vm.launch(app) }) {
                             VStack(spacing: 0) {
                                 Image(nsImage: app.icon)
                                     .resizable()
                                     .frame(width: 80, height: 80)
                                 Text(app.name)
-                                    .font(.title3) // Dynamic system font, readable but compact
+                                    .font(.title3)
                                     .lineLimit(1)
                                     .foregroundColor(.primary.opacity(0.9))
                             }
                             .padding(3)
                             .frame(maxWidth: .infinity)
-                            // Selection Highlight
-                            .background(vm.filtered.first?.id == app.id ? Color.accentColor.opacity(0.2) : .clear)
+                            .background(selectedIndex == index ? Color.accentColor.opacity(0.2) : .clear)
                             .cornerRadius(12)
                         }
                         .buttonStyle(.plain)
@@ -119,15 +172,45 @@ struct ContentView: View {
                 .padding(.bottom, 20)
             }
         }
-        // Window Background & Shape
         .background(EffectView(material: .underWindowBackground).opacity(0.85))
         .clipShape(RoundedRectangle(cornerRadius: 20))
         .overlay(RoundedRectangle(cornerRadius: 20).stroke(Color.white.opacity(0.1), lineWidth: 1))
-        .onAppear { focus = true }
+        .onAppear { 
+            focus = true
+            NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                handleKeyDown(event)
+            }
+        }
+        .onReceive(vm.$searchText) { newText in
+            if newText != previousSearchText {
+                selectedIndex = 0
+                previousSearchText = newText
+            }
+        }
+    }
+    
+    func handleKeyDown(_ event: NSEvent) -> NSEvent? {
+        let cols = max(1, Int((700 - 40) / 113))
+        
+        switch Int(event.keyCode) {
+        case 125: // Down
+            selectedIndex = min(selectedIndex + cols, vm.filtered.count - 1)
+            return nil
+        case 126: // Up
+            selectedIndex = max(selectedIndex - cols, 0)
+            return nil
+        case 124: // Right
+            selectedIndex = min(selectedIndex + 1, vm.filtered.count - 1)
+            return nil
+        case 123: // Left
+            selectedIndex = max(selectedIndex - 1, 0)
+            return nil
+        default:
+            return event
+        }
     }
 }
 
-// Helper for Visual Effect (Blur)
 struct EffectView: NSViewRepresentable {
     let material: NSVisualEffectView.Material
     func makeNSView(context: Context) -> NSVisualEffectView {
@@ -142,7 +225,6 @@ struct EffectView: NSViewRepresentable {
 
 // MARK: - App Delegate & Window Setup
 class LauncherWindow: NSWindow {
-    // Allow borderless window to accept key input
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 }
@@ -153,7 +235,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.regular)
         
-        // Window Configuration
         window = LauncherWindow(
             contentRect: NSRect(x: 0, y: 0, width: 700, height: 500),
             styleMask: [.borderless, .fullSizeContentView, .resizable],
@@ -161,15 +242,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         window.isOpaque = false
         window.backgroundColor = .clear
-        window.level = .floating // Keep above other windows
+        window.level = .floating
         window.isMovableByWindowBackground = true
-        
-        // Persistence: Remember window size/position
         window.setFrameAutosaveName("LauncherMainWindow")
-        
         window.contentView = NSHostingView(rootView: ContentView())
         
-        // Center only if no saved position exists
         if !window.setFrameUsingName("LauncherMainWindow") {
             window.center()
         }
@@ -178,7 +255,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
     
-    // Quit when user clicks away
     func applicationDidResignActive(_ n: Notification) {
         NSApp.terminate(nil)
     }
